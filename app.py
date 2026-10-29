@@ -165,10 +165,27 @@ with dashboard:
     """, (start_s, end_s))
     monthly_all = pd.merge(monthly, monthly_exp, on='month', how='outer').fillna(0) if not monthly.empty or not monthly_exp.empty else pd.DataFrame()
     if not monthly_all.empty:
+        # SQLite may return integer, float, or object columns depending on the
+        # records entered. Normalize both series before plotting to avoid
+        # Plotly Express wide-form mixed-dtype errors.
+        for col in ('collections', 'expenses'):
+            monthly_all[col] = pd.to_numeric(monthly_all[col], errors='coerce').fillna(0).astype(float)
+        monthly_all['month'] = monthly_all['month'].astype(str)
         monthly_all['net_result'] = monthly_all['collections'] - monthly_all['expenses']
         left, right = st.columns(2)
         with left:
-            st.plotly_chart(px.bar(monthly_all, x='month', y=['collections','expenses'], barmode='group', title='Collections vs expenses', labels={'value':'Amount (₹)','month':'Month','variable':''}), use_container_width=True)
+            chart_data = monthly_all.melt(
+                id_vars=['month'],
+                value_vars=['collections', 'expenses'],
+                var_name='type',
+                value_name='amount',
+            )
+            st.plotly_chart(
+                px.bar(chart_data, x='month', y='amount', color='type', barmode='group',
+                       title='Collections vs expenses',
+                       labels={'amount': 'Amount (₹)', 'month': 'Month', 'type': 'Category'}),
+                use_container_width=True,
+            )
         with right:
             st.plotly_chart(px.line(monthly_all, x='month', y='net_result', markers=True, title='Net operating result by month', labels={'net_result':'Amount (₹)','month':'Month'}), use_container_width=True)
     else:
@@ -344,4 +361,5 @@ with export_tab:
 st.sidebar.markdown("### Prototype notes")
 st.sidebar.caption("Single-clinic local SQLite prototype. No login, roles, audit log, encrypted database, automated backups, or multi-clinic separation yet.")
 st.sidebar.caption("Built with Streamlit + SQLite + Pandas + Plotly")
+
 
