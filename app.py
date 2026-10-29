@@ -116,6 +116,13 @@ else:
     st.markdown('<div class="hero"><h1>Welcome to Dental Practice Growth Analytics</h1><p>Upload a monthly metrics CSV from the sidebar, or switch to sample data to explore the dashboard.</p></div>', unsafe_allow_html=True)
     st.stop()
 
+# Normalize date dtype for both sample data and uploaded CSVs.
+# Keep this conversion immediately before using the pandas .dt accessor.
+df["date"] = pd.to_datetime(df["date"], errors="coerce")
+if df["date"].isna().any():
+    st.error("The date column contains invalid values. Please use dates such as 2026-01-01.")
+    st.stop()
+
 # Derived metrics
 df["net_operating_result"] = df["revenue"] - df["expenses"]
 df["attendance_rate"] = (df["appointments_attended"] / df["appointments_booked"].replace(0, pd.NA) * 100).fillna(0)
