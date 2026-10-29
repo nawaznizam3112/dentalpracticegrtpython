@@ -1,259 +1,347 @@
 from __future__ import annotations
 
-from io import BytesIO
-from datetime import date
+import sqlite3
+from pathlib import Path
+from datetime import date, datetime, timedelta
 import pandas as pd
 import plotly.express as px
 import streamlit as st
 
-st.set_page_config(
-    page_title="Dental Practice Growth Analytics",
-    page_icon="🦷",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
+APP_DIR = Path(__file__).resolve().parent
+DB_PATH = Path(__import__('os').environ.get('DENTAL_DB_PATH', str(APP_DIR / 'clinic.db')))
 
-# ---------- Theme / helpers ----------
+st.set_page_config(page_title="Dental Clinic OS", page_icon="🦷", layout="wide")
 st.markdown("""
 <style>
-    .block-container {padding-top: 1.5rem; padding-bottom: 2.5rem; max-width: 1440px;}
-    [data-testid="stMetric"] {background: #f7f9fc; border: 1px solid #e5eaf2; padding: 16px 18px; border-radius: 14px;}
-    .hero {padding: 22px 24px; border-radius: 18px; background: linear-gradient(120deg,#eaf5ff,#f4fbf7); border: 1px solid #dceaf4; margin-bottom: 18px;}
-    .hero h1 {margin: 0 0 6px 0; font-size: 1.9rem;}
-    .hero p {margin: 0; color: #425466;}
-    .small-note {font-size: 0.85rem; color: #617184;}
-    div[data-testid="stDataFrame"] {border-radius: 12px;}
+.block-container {padding-top: 1.2rem; max-width: 1500px;}
+[data-testid="stMetric"] {background:#f7f9fc;border:1px solid #e5eaf2;padding:14px 16px;border-radius:12px;}
+.hero {padding:20px 22px;border-radius:16px;background:linear-gradient(120deg,#eaf5ff,#f4fbf7);border:1px solid #dceaf4;margin-bottom:16px;}
 </style>
 """, unsafe_allow_html=True)
 
-REQUIRED_COLUMNS = [
-    "date", "revenue", "expenses", "appointments_booked",
-    "appointments_attended", "treatment_plans_presented",
-    "treatment_plans_accepted", "new_patients", "returning_patients"
-]
-NUMERIC_COLUMNS = REQUIRED_COLUMNS[1:]
+# ---------------- Database ----------------
+def get_conn():
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
 
-@st.cache_data
-def make_sample_data() -> pd.DataFrame:
-    # Synthetic monthly practice-level data; no real patient data.
-    dates = pd.date_range(end=pd.Timestamp.today().normalize().replace(day=1), periods=12, freq="MS")
-    rows = []
-    for i, dt in enumerate(dates):
-        seasonal = 1 + 0.08 * ((i % 4) - 1.5)
-        booked = int(155 + i * 2 + (i % 3) * 7)
-        attended = int(booked * (0.77 + (i % 4) * 0.025))
-        presented = int(attended * 0.55)
-        accepted = int(presented * (0.48 + (i % 3) * 0.04))
-        revenue = round((245000 + i * 9000) * seasonal, 0)
-        expenses = round(revenue * (0.53 + (i % 3) * 0.015), 0)
-        rows.append({
-            "date": dt.date().isoformat(),
-            "revenue": int(revenue),
-            "expenses": int(expenses),
-            "appointments_booked": booked,
-            "appointments_attended": attended,
-            "treatment_plans_presented": presented,
-            "treatment_plans_accepted": accepted,
-            "new_patients": int(18 + (i % 5) * 2),
-            "returning_patients": int(58 + i * 2 + (i % 3) * 4),
-        })
-    return pd.DataFrame(rows)
 
-def normalize_data(raw: pd.DataFrame) -> pd.DataFrame:
-    df = raw.copy()
-    df.columns = [str(c).strip().lower().replace(" ", "_") for c in df.columns]
-    missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]
-    if missing:
-        raise ValueError("Missing required columns: " + ", ".join(missing))
-    df = df[REQUIRED_COLUMNS].copy()
-    df["date"] = pd.to_datetime(df["date"], errors="coerce")
-    if df["date"].isna().any():
-        raise ValueError("Some dates could not be read. Use YYYY-MM-DD, for example 2026-01-31.")
-    for col in NUMERIC_COLUMNS:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-        if df[col].isna().any():
-            raise ValueError(f"Column '{col}' contains blank or non-numeric values.")
-        if (df[col] < 0).any():
-            raise ValueError(f"Column '{col}' cannot contain negative values.")
-    if (df["appointments_attended"] > df["appointments_booked"]).any():
-        raise ValueError("Attended appointments cannot exceed appointments booked.")
-    if (df["treatment_plans_accepted"] > df["treatment_plans_presented"]).any():
-        raise ValueError("Accepted treatment plans cannot exceed plans presented.")
-    return df.sort_values("date").reset_index(drop=True)
+def init_db():
+    with get_conn() as conn:
+        conn.executescript("""
+        CREATE TABLE IF NOT EXISTS patients (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            patient_code TEXT UNIQUE,
+            full_name TEXT NOT NULL,
+            phone TEXT,
+            email TEXT,
+            registration_date TEXT NOT NULL,
+            notes TEXT DEFAULT ''
+        );
+        CREATE TABLE IF NOT EXISTS appointments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            patient_id INTEGER NOT NULL,
+            appointment_date TEXT NOT NULL,
+            reason TEXT DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'Booked',
+            notes TEXT DEFAULT '',
+            FOREIGN KEY(patient_id) REFERENCES patients(id) ON DELETE RESTRICT
+        );
+        CREATE TABLE IF NOT EXISTS treatment_plans (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            patient_id INTEGER NOT NULL,
+            plan_date TEXT NOT NULL,
+            description TEXT NOT NULL,
+            estimated_amount REAL NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'Presented',
+            notes TEXT DEFAULT '',
+            FOREIGN KEY(patient_id) REFERENCES patients(id) ON DELETE RESTRICT
+        );
+        CREATE TABLE IF NOT EXISTS payments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            patient_id INTEGER NOT NULL,
+            payment_date TEXT NOT NULL,
+            amount REAL NOT NULL CHECK(amount >= 0),
+            method TEXT DEFAULT 'UPI',
+            description TEXT DEFAULT '',
+            FOREIGN KEY(patient_id) REFERENCES patients(id) ON DELETE RESTRICT
+        );
+        CREATE TABLE IF NOT EXISTS expenses (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            expense_date TEXT NOT NULL,
+            category TEXT NOT NULL,
+            description TEXT DEFAULT '',
+            amount REAL NOT NULL CHECK(amount >= 0)
+        );
+        CREATE INDEX IF NOT EXISTS idx_appointments_date ON appointments(appointment_date);
+        CREATE INDEX IF NOT EXISTS idx_payments_date ON payments(payment_date);
+        CREATE INDEX IF NOT EXISTS idx_expenses_date ON expenses(expense_date);
+        """)
 
-def inr(value: float) -> str:
-    return "₹" + f"{value:,.0f}"
 
-def to_csv_bytes(df: pd.DataFrame) -> bytes:
-    return df.to_csv(index=False).encode("utf-8")
+def query_df(sql: str, params=()) -> pd.DataFrame:
+    with get_conn() as conn:
+        return pd.read_sql_query(sql, conn, params=params)
 
-# ---------- Sidebar ----------
-st.sidebar.title("🦷 Practice Analytics")
-st.sidebar.caption("Version 0.1 · MVP")
-source = st.sidebar.radio("Data source", ["Use sample data", "Upload my CSV"], index=0)
-uploaded = None
-if source == "Upload my CSV":
-    uploaded = st.sidebar.file_uploader("Upload monthly clinic metrics (.csv)", type=["csv"])
-st.sidebar.divider()
-st.sidebar.markdown("**Privacy first**")
-st.sidebar.caption("Start with synthetic data. Do not upload identifiable patient records. Use aggregated clinic-level metrics only until secure data handling is implemented.")
-st.sidebar.markdown("---")
-st.sidebar.caption("Built with Python · Streamlit · Pandas · Plotly")
 
-# ---------- Load data ----------
-if source == "Use sample data":
-    df = make_sample_data()
-    is_sample = True
-elif uploaded is not None:
-    try:
-        df = normalize_data(pd.read_csv(uploaded))
-        is_sample = False
-    except Exception as exc:
-        st.error(f"Could not use this CSV: {exc}")
-        st.info("Download the template from the Data & Export page, fill it with monthly aggregate figures, then upload it again.")
-        st.stop()
-else:
-    st.markdown('<div class="hero"><h1>Welcome to Dental Practice Growth Analytics</h1><p>Upload a monthly metrics CSV from the sidebar, or switch to sample data to explore the dashboard.</p></div>', unsafe_allow_html=True)
-    st.stop()
+def execute(sql: str, params=()):
+    with get_conn() as conn:
+        conn.execute(sql, params)
+        conn.commit()
 
-# Normalize date dtype for both sample data and uploaded CSVs.
-# Keep this conversion immediately before using the pandas .dt accessor.
-df["date"] = pd.to_datetime(df["date"], errors="coerce")
-if df["date"].isna().any():
-    st.error("The date column contains invalid values. Please use dates such as 2026-01-01.")
-    st.stop()
 
-# Derived metrics
-df["net_operating_result"] = df["revenue"] - df["expenses"]
-df["attendance_rate"] = (df["appointments_attended"] / df["appointments_booked"].replace(0, pd.NA) * 100).fillna(0)
-df["treatment_acceptance_rate"] = (df["treatment_plans_accepted"] / df["treatment_plans_presented"].replace(0, pd.NA) * 100).fillna(0)
-df["total_patients_seen"] = df["new_patients"] + df["returning_patients"]
-df["month"] = df["date"].dt.strftime("%b %Y")
+def money(value) -> str:
+    return f"₹{float(value or 0):,.0f}"
 
-# ---------- Header ----------
-st.markdown(f"""
-<div class="hero">
-  <h1>Dental Practice Growth Analytics</h1>
-  <p>Understand your clinic's performance, spot trends, and choose your next action.</p>
-</div>
-""", unsafe_allow_html=True)
-if is_sample:
-    st.info("You are viewing **synthetic sample data**. Figures are illustrative and do not represent a real clinic.", icon="ℹ️")
 
-# Date range filter
-min_date, max_date = df["date"].min().date(), df["date"].max().date()
-with st.sidebar:
-    st.subheader("Filter period")
-    date_range = st.date_input("Date range", value=(min_date, max_date), min_value=min_date, max_value=max_date)
-if isinstance(date_range, tuple) and len(date_range) == 2:
-    start_date, end_date = date_range
-else:
-    start_date, end_date = min_date, max_date
-view = df[(df["date"].dt.date >= start_date) & (df["date"].dt.date <= end_date)].copy()
-if view.empty:
-    st.warning("No rows in the selected date range.")
-    st.stop()
+def patient_options() -> tuple[list[str], dict[str, int]]:
+    patients = query_df("SELECT id, patient_code, full_name, phone FROM patients ORDER BY full_name")
+    labels = []
+    mapping = {}
+    for row in patients.itertuples(index=False):
+        label = f"{row.patient_code or ('P'+str(row.id))} · {row.full_name}" + (f" · {row.phone}" if row.phone else "")
+        labels.append(label)
+        mapping[label] = int(row.id)
+    return labels, mapping
 
-# ---------- Navigation ----------
-overview, trends, actions, data_tab = st.tabs(["Overview", "Trends", "Action ideas", "Data & export"])
+init_db()
 
-with overview:
-    st.subheader("Practice at a glance")
-    total_revenue = view["revenue"].sum()
-    total_expenses = view["expenses"].sum()
-    net = view["net_operating_result"].sum()
-    booked = view["appointments_booked"].sum()
-    attended = view["appointments_attended"].sum()
-    presented = view["treatment_plans_presented"].sum()
-    accepted = view["treatment_plans_accepted"].sum()
-    attendance = attended / booked * 100 if booked else 0
-    acceptance = accepted / presented * 100 if presented else 0
+st.markdown('<div class="hero"><h1>🦷 Dental Clinic OS</h1><p>Clinic management and growth metrics in one place — prototype v0.2</p></div>', unsafe_allow_html=True)
+st.warning("Prototype only. Use synthetic/test records until security, authentication, backups, and durable hosting are implemented. Do not deploy this version for real patient data on a public link.", icon="🔒")
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Total revenue", inr(total_revenue))
-    c2.metric("Expenses", inr(total_expenses))
-    c3.metric("Net operating result", inr(net), help="Revenue minus the expenses entered. Not a formal accounting profit figure.")
-    c4.metric("Attendance rate", f"{attendance:.1f}%")
-    c5, c6, c7, c8 = st.columns(4)
-    c5.metric("Appointments booked", f"{booked:,.0f}")
-    c6.metric("Appointments attended", f"{attended:,.0f}")
-    c7.metric("Treatment acceptance", f"{acceptance:.1f}%")
-    c8.metric("Patients seen", f"{view['total_patients_seen'].sum():,.0f}")
+# ---------------- Navigation ----------------
+dashboard, patients_tab, appointments_tab, treatment_tab, payments_tab, expenses_tab, export_tab = st.tabs([
+    "📊 Growth dashboard", "👤 Patients", "📅 Appointments", "🦷 Treatment plans", "💳 Payments", "🧾 Expenses", "📤 Export"
+])
 
-    left, right = st.columns(2)
-    with left:
-        fig = px.bar(view, x="month", y=["revenue", "expenses"], barmode="group",
-                     title="Revenue vs expenses", labels={"value": "Amount (₹)", "month": "Month", "variable": ""})
-        fig.update_layout(legend_title_text="", margin=dict(l=10,r=10,t=55,b=10))
-        st.plotly_chart(fig, use_container_width=True)
-    with right:
-        fig = px.line(view, x="month", y="net_operating_result", markers=True,
-                      title="Net operating result by month", labels={"net_operating_result": "Amount (₹)", "month": "Month"})
-        fig.update_layout(margin=dict(l=10,r=10,t=55,b=10))
-        st.plotly_chart(fig, use_container_width=True)
+with dashboard:
+    st.subheader("Practice performance")
+    period = st.selectbox("Reporting period", ["This month", "Last 30 days", "This year", "All time"], index=0, key="dash_period")
+    today = date.today()
+    if period == "This month":
+        start = today.replace(day=1)
+    elif period == "Last 30 days":
+        start = today - timedelta(days=29)
+    elif period == "This year":
+        start = today.replace(month=1, day=1)
+    else:
+        start = date(2000, 1, 1)
+    start_s, end_s = start.isoformat(), today.isoformat()
 
-    st.subheader("Monthly snapshot")
-    display = view[["month", "revenue", "expenses", "net_operating_result", "appointments_booked", "appointments_attended", "attendance_rate", "treatment_acceptance_rate"]].copy()
-    display = display.rename(columns={"month":"Month","revenue":"Revenue (₹)","expenses":"Expenses (₹)","net_operating_result":"Net result (₹)","appointments_booked":"Booked","appointments_attended":"Attended","attendance_rate":"Attendance (%)","treatment_acceptance_rate":"Acceptance (%)"})
-    st.dataframe(display, use_container_width=True, hide_index=True)
+    rev_df = query_df("SELECT COALESCE(SUM(amount),0) AS total FROM payments WHERE payment_date BETWEEN ? AND ?", (start_s, end_s))
+    exp_df = query_df("SELECT COALESCE(SUM(amount),0) AS total FROM expenses WHERE expense_date BETWEEN ? AND ?", (start_s, end_s))
+    revenue = float(rev_df.iloc[0]['total'])
+    expenses = float(exp_df.iloc[0]['total'])
+    appts = query_df("SELECT status, COUNT(*) AS n FROM appointments WHERE appointment_date BETWEEN ? AND ? GROUP BY status", (start_s, end_s))
+    status_counts = {str(r['status']): int(r['n']) for _, r in appts.iterrows()}
+    booked = sum(status_counts.values())
+    attended = status_counts.get('Completed', 0)
+    attendance_rate = attended / booked * 100 if booked else 0
+    new_patients = int(query_df("SELECT COUNT(*) AS n FROM patients WHERE registration_date BETWEEN ? AND ?", (start_s, end_s)).iloc[0]['n'])
+    plans = query_df("SELECT status, COUNT(*) AS n, COALESCE(SUM(estimated_amount),0) AS value FROM treatment_plans WHERE plan_date BETWEEN ? AND ? GROUP BY status", (start_s, end_s))
+    presented_count = int(plans[plans['status'].isin(['Presented','Accepted','Declined'])]['n'].sum()) if not plans.empty else 0
+    accepted_count = int(plans[plans['status'] == 'Accepted']['n'].sum()) if not plans.empty else 0
+    acceptance = accepted_count / presented_count * 100 if presented_count else 0
+    outstanding_value = float(query_df("SELECT COALESCE(SUM(estimated_amount),0) AS total FROM treatment_plans WHERE status IN ('Presented','Pending')").iloc[0]['total'])
 
-with trends:
-    st.subheader("Performance trends")
-    left, right = st.columns(2)
-    with left:
-        fig = px.line(view, x="month", y=["attendance_rate", "treatment_acceptance_rate"], markers=True,
-                      title="Attendance and treatment acceptance",
-                      labels={"value":"Rate (%)","month":"Month","variable":"Metric"})
-        fig.update_layout(legend_title_text="", yaxis_ticksuffix="%", margin=dict(l=10,r=10,t=55,b=10))
-        st.plotly_chart(fig, use_container_width=True)
-    with right:
-        patient_trend = view[["month", "new_patients", "returning_patients"]].melt(id_vars="month", var_name="patient_type", value_name="count")
-        fig = px.bar(patient_trend, x="month", y="count", color="patient_type", barmode="stack",
-                     title="New vs returning patients", labels={"count":"Patients","month":"Month","patient_type":"Type"})
-        fig.update_layout(legend_title_text="", margin=dict(l=10,r=10,t=55,b=10))
-        st.plotly_chart(fig, use_container_width=True)
-    st.caption("These are descriptive metrics, not benchmarks. Compare against your own historical performance and clinic context.")
+    cols = st.columns(4)
+    cols[0].metric("Collections", money(revenue))
+    cols[1].metric("Recorded expenses", money(expenses))
+    cols[2].metric("Net operating result", money(revenue-expenses), help="Collections minus expenses entered; not formal accounting profit.")
+    cols[3].metric("Appointment attendance", f"{attendance_rate:.1f}%")
+    cols = st.columns(4)
+    cols[0].metric("Appointments", f"{booked:,}")
+    cols[1].metric("New patients", f"{new_patients:,}")
+    cols[2].metric("Treatment acceptance", f"{acceptance:.1f}%")
+    cols[3].metric("Presented/pending plan value", money(outstanding_value))
 
-with actions:
-    st.subheader("Suggested areas to investigate")
-    st.caption("These rules are simple prompts for review, not clinical or financial advice.")
-    suggestions = []
-    if attendance < 80:
-        suggestions.append(("Review appointment attendance", f"Attendance is {attendance:.1f}%. Review cancellation patterns, reminder timing, and rescheduling workflows."))
-    if acceptance < 50 and presented > 0:
-        suggestions.append(("Review treatment-plan follow-through", f"Acceptance is {acceptance:.1f}%. Review how options, estimates, and follow-up conversations are documented."))
-    if total_revenue > 0 and net / total_revenue < 0.35:
-        suggestions.append(("Review operating costs", f"Expenses represent {(total_expenses/total_revenue*100):.1f}% of revenue in the selected period. Check cost categories and whether all figures are entered consistently."))
-    if len(view) >= 2:
-        first_rev, last_rev = view.iloc[0]["revenue"], view.iloc[-1]["revenue"]
-        if first_rev and last_rev < first_rev:
-            suggestions.append(("Investigate revenue trend", "Revenue in the last selected month is below the first selected month. Compare appointment volume, case mix, and seasonality before drawing conclusions."))
-    if not suggestions:
-        suggestions.append(("Choose one metric to improve", "No simple rule was triggered. Compare month-to-month changes and select one operational metric to investigate."))
-    for title, body in suggestions:
-        with st.container(border=True):
-            st.markdown(f"**{title}**")
-            st.write(body)
-    st.markdown("#### Weekly experiment")
-    st.write("Pick one operational change, record the date, and compare the relevant metric over a consistent period. Avoid changing several things at once.")
+    monthly = query_df("""
+        SELECT substr(payment_date,1,7) AS month, SUM(amount) AS collections
+        FROM payments WHERE payment_date BETWEEN ? AND ? GROUP BY substr(payment_date,1,7) ORDER BY month
+    """, (start_s, end_s))
+    monthly_exp = query_df("""
+        SELECT substr(expense_date,1,7) AS month, SUM(amount) AS expenses
+        FROM expenses WHERE expense_date BETWEEN ? AND ? GROUP BY substr(expense_date,1,7) ORDER BY month
+    """, (start_s, end_s))
+    monthly_all = pd.merge(monthly, monthly_exp, on='month', how='outer').fillna(0) if not monthly.empty or not monthly_exp.empty else pd.DataFrame()
+    if not monthly_all.empty:
+        monthly_all['net_result'] = monthly_all['collections'] - monthly_all['expenses']
+        left, right = st.columns(2)
+        with left:
+            st.plotly_chart(px.bar(monthly_all, x='month', y=['collections','expenses'], barmode='group', title='Collections vs expenses', labels={'value':'Amount (₹)','month':'Month','variable':''}), use_container_width=True)
+        with right:
+            st.plotly_chart(px.line(monthly_all, x='month', y='net_result', markers=True, title='Net operating result by month', labels={'net_result':'Amount (₹)','month':'Month'}), use_container_width=True)
+    else:
+        st.info("Add payments and expenses to see financial trends. The dashboard starts empty intentionally; no fake clinic data is inserted.")
 
-with data_tab:
-    st.subheader("Data preview")
-    st.dataframe(view[REQUIRED_COLUMNS], use_container_width=True, hide_index=True)
-    st.download_button("Download filtered data (CSV)", data=to_csv_bytes(view[REQUIRED_COLUMNS]),
-                       file_name="dental_practice_metrics.csv", mime="text/csv")
-    st.download_button("Download CSV template", data=to_csv_bytes(make_sample_data()[REQUIRED_COLUMNS].head(0)),
-                       file_name="dental_metrics_template.csv", mime="text/csv")
-    st.markdown("#### Required CSV columns")
-    st.code(", ".join(REQUIRED_COLUMNS), language="text")
-    st.markdown("""
-**Data definitions**
-- One row per month; `date` can be any date within that month.
-- `revenue` and `expenses`: aggregate amounts in INR.
-- Appointment and treatment fields: non-negative monthly counts.
-- `treatment_plans_accepted` must not exceed `treatment_plans_presented`.
-- Use aggregated clinic-level figures. Do not include names, phone numbers, addresses, diagnoses, or other identifiable patient information.
-""")
+    st.subheader("Operational prompts (rule-based, not AI yet)")
+    prompts = []
+    if booked and attendance_rate < 80:
+        prompts.append(f"Attendance is {attendance_rate:.1f}%. Review missed/cancelled appointment patterns and reminder workflows.")
+    if presented_count and acceptance < 50:
+        prompts.append(f"Treatment-plan acceptance is {acceptance:.1f}%. Review how estimates, options, and follow-up are explained and documented.")
+    if revenue and expenses/revenue > 0.65:
+        prompts.append(f"Recorded expenses are {expenses/revenue:.1%} of collections in this period. Check expense categorisation and compare with your own past months.")
+    if not prompts:
+        prompts.append("As you enter real operational records, this area will surface simple patterns to investigate. These are prompts, not clinical or financial advice.")
+    for prompt in prompts:
+        st.write("• " + prompt)
 
-st.markdown("---")
-st.markdown('<p class="small-note">Dental Practice Growth Analytics · MVP v0.1 · For operational exploration only. Validate inputs and consult your accountant for formal financial reporting.</p>', unsafe_allow_html=True)
+with patients_tab:
+    st.subheader("Patient register")
+    with st.form("add_patient", clear_on_submit=True):
+        c1, c2 = st.columns(2)
+        full_name = c1.text_input("Full name *")
+        phone = c2.text_input("Phone")
+        email = c1.text_input("Email (optional)")
+        registration_date = c2.date_input("Registration date", value=date.today())
+        notes = st.text_area("Administrative notes only (optional)", help="Avoid unnecessary sensitive clinical details in this prototype.")
+        submitted = st.form_submit_button("Add patient", type="primary")
+        if submitted:
+            if not full_name.strip():
+                st.error("Patient name is required.")
+            else:
+                code = "P" + datetime.now().strftime("%y%m%d%H%M%S%f")[-12:]
+                try:
+                    execute("INSERT INTO patients(patient_code,full_name,phone,email,registration_date,notes) VALUES(?,?,?,?,?,?)", (code, full_name.strip(), phone.strip(), email.strip(), registration_date.isoformat(), notes.strip()))
+                    st.success(f"Patient added. ID: {code}")
+                    st.rerun()
+                except sqlite3.IntegrityError as e:
+                    st.error(f"Could not add patient: {e}")
+    patients = query_df("SELECT id, patient_code AS 'Patient ID', full_name AS 'Name', phone AS 'Phone', email AS 'Email', registration_date AS 'Registered', notes AS 'Admin notes' FROM patients ORDER BY id DESC")
+    st.dataframe(patients.drop(columns=['id']) if not patients.empty else patients, use_container_width=True, hide_index=True)
+    if not patients.empty:
+        with st.expander("Update or remove a test patient"):
+            st.caption("Deletion is blocked if appointments, treatment plans, or payments are linked to the patient.")
+            chosen = st.selectbox("Choose patient", patients['id'].tolist(), format_func=lambda x: f"{patients.loc[patients.id==x, 'Patient ID'].iloc[0]} · {patients.loc[patients.id==x, 'Name'].iloc[0]}")
+            if st.button("Delete selected patient", key="delete_patient"):
+                try:
+                    execute("DELETE FROM patients WHERE id=?", (int(chosen),))
+                    st.success("Patient deleted.")
+                    st.rerun()
+                except sqlite3.IntegrityError:
+                    st.error("This patient has linked records. Keep the record and use an appropriate retention/deactivation process instead.")
+
+with appointments_tab:
+    st.subheader("Appointments")
+    labels, pmap = patient_options()
+    if not labels:
+        st.info("Add a patient first to create an appointment.")
+    else:
+        with st.form("add_appointment", clear_on_submit=True):
+            patient_label = st.selectbox("Patient", labels)
+            appt_date = st.date_input("Appointment date", value=date.today(), key="appt_date")
+            reason = st.text_input("Appointment type / reason")
+            status = st.selectbox("Status", ["Booked", "Completed", "Cancelled", "No-show", "Rescheduled"])
+            appt_notes = st.text_input("Administrative note (optional)")
+            submitted = st.form_submit_button("Save appointment", type="primary")
+            if submitted:
+                execute("INSERT INTO appointments(patient_id,appointment_date,reason,status,notes) VALUES(?,?,?,?,?)", (pmap[patient_label], appt_date.isoformat(), reason.strip(), status, appt_notes.strip()))
+                st.success("Appointment saved.")
+                st.rerun()
+    appointments = query_df("SELECT a.id, a.appointment_date AS Date, p.patient_code AS 'Patient ID', p.full_name AS Patient, a.reason AS Reason, a.status AS Status, a.notes AS Notes FROM appointments a JOIN patients p ON p.id=a.patient_id ORDER BY a.appointment_date DESC, a.id DESC")
+    st.dataframe(appointments.drop(columns=['id']) if not appointments.empty else appointments, use_container_width=True, hide_index=True)
+    if not appointments.empty:
+        with st.form("update_appointment_status"):
+            appt_id = st.selectbox("Appointment to update", appointments['id'].tolist(), format_func=lambda x: f"#{x} · {appointments.loc[appointments.id==x,'Date'].iloc[0]} · {appointments.loc[appointments.id==x,'Patient'].iloc[0]}")
+            new_status = st.selectbox("New status", ["Booked", "Completed", "Cancelled", "No-show", "Rescheduled"])
+            if st.form_submit_button("Update status"):
+                execute("UPDATE appointments SET status=? WHERE id=?", (new_status, int(appt_id)))
+                st.success("Appointment updated.")
+                st.rerun()
+
+with treatment_tab:
+    st.subheader("Treatment plans")
+    labels, pmap = patient_options()
+    if not labels:
+        st.info("Add a patient first to record a treatment plan.")
+    else:
+        with st.form("add_treatment_plan", clear_on_submit=True):
+            patient_label = st.selectbox("Patient", labels, key="tp_patient")
+            plan_date = st.date_input("Plan date", value=date.today(), key="plan_date")
+            description = st.text_input("Plan description *", placeholder="e.g., restorative treatment plan")
+            amount = st.number_input("Estimated amount (₹)", min_value=0.0, step=500.0)
+            plan_status = st.selectbox("Status", ["Presented", "Accepted", "Pending", "Declined", "Completed"])
+            plan_notes = st.text_input("Note (optional)")
+            submitted = st.form_submit_button("Save treatment plan", type="primary")
+            if submitted:
+                if not description.strip():
+                    st.error("Enter a plan description.")
+                else:
+                    execute("INSERT INTO treatment_plans(patient_id,plan_date,description,estimated_amount,status,notes) VALUES(?,?,?,?,?,?)", (pmap[patient_label], plan_date.isoformat(), description.strip(), float(amount), plan_status, plan_notes.strip()))
+                    st.success("Treatment plan saved.")
+                    st.rerun()
+    plans_df = query_df("SELECT t.id, t.plan_date AS Date, p.patient_code AS 'Patient ID', p.full_name AS Patient, t.description AS Plan, t.estimated_amount AS 'Estimate (₹)', t.status AS Status, t.notes AS Notes FROM treatment_plans t JOIN patients p ON p.id=t.patient_id ORDER BY t.plan_date DESC, t.id DESC")
+    st.dataframe(plans_df.drop(columns=['id']) if not plans_df.empty else plans_df, use_container_width=True, hide_index=True)
+    if not plans_df.empty:
+        with st.form("update_treatment_status"):
+            plan_id = st.selectbox("Plan to update", plans_df['id'].tolist(), format_func=lambda x: f"#{x} · {plans_df.loc[plans_df.id==x,'Patient'].iloc[0]} · {plans_df.loc[plans_df.id==x,'Plan'].iloc[0]}")
+            new_plan_status = st.selectbox("New status", ["Presented", "Accepted", "Pending", "Declined", "Completed"])
+            if st.form_submit_button("Update plan status"):
+                execute("UPDATE treatment_plans SET status=? WHERE id=?", (new_plan_status, int(plan_id)))
+                st.success("Treatment plan updated.")
+                st.rerun()
+
+with payments_tab:
+    st.subheader("Payments / collections")
+    labels, pmap = patient_options()
+    if not labels:
+        st.info("Add a patient first to record a payment.")
+    else:
+        with st.form("add_payment", clear_on_submit=True):
+            patient_label = st.selectbox("Patient", labels, key="pay_patient")
+            pay_date = st.date_input("Payment date", value=date.today(), key="pay_date")
+            amount = st.number_input("Amount received (₹)", min_value=0.0, step=500.0, key="pay_amount")
+            method = st.selectbox("Payment method", ["UPI", "Cash", "Card", "Bank transfer", "Other"])
+            description = st.text_input("Reference / description")
+            submitted = st.form_submit_button("Record payment", type="primary")
+            if submitted:
+                if amount <= 0:
+                    st.error("Payment amount must be greater than zero.")
+                else:
+                    execute("INSERT INTO payments(patient_id,payment_date,amount,method,description) VALUES(?,?,?,?,?)", (pmap[patient_label], pay_date.isoformat(), float(amount), method, description.strip()))
+                    st.success("Payment recorded.")
+                    st.rerun()
+    payment_df = query_df("SELECT x.id, x.payment_date AS Date, p.patient_code AS 'Patient ID', p.full_name AS Patient, x.amount AS 'Amount (₹)', x.method AS Method, x.description AS Description FROM payments x JOIN patients p ON p.id=x.patient_id ORDER BY x.payment_date DESC, x.id DESC")
+    st.dataframe(payment_df.drop(columns=['id']) if not payment_df.empty else payment_df, use_container_width=True, hide_index=True)
+
+with expenses_tab:
+    st.subheader("Clinic expenses")
+    with st.form("add_expense", clear_on_submit=True):
+        expense_date = st.date_input("Expense date", value=date.today())
+        category = st.selectbox("Category", ["Rent", "Salaries", "Lab charges", "Materials", "Utilities", "Marketing", "Equipment", "Software", "Maintenance", "Other"])
+        description = st.text_input("Description")
+        amount = st.number_input("Amount (₹)", min_value=0.0, step=500.0, key="expense_amount")
+        submitted = st.form_submit_button("Record expense", type="primary")
+        if submitted:
+            if amount <= 0:
+                st.error("Expense amount must be greater than zero.")
+            else:
+                execute("INSERT INTO expenses(expense_date,category,description,amount) VALUES(?,?,?,?)", (expense_date.isoformat(), category, description.strip(), float(amount)))
+                st.success("Expense recorded.")
+                st.rerun()
+    expense_df = query_df("SELECT id, expense_date AS Date, category AS Category, description AS Description, amount AS 'Amount (₹)' FROM expenses ORDER BY expense_date DESC, id DESC")
+    st.dataframe(expense_df, use_container_width=True, hide_index=True)
+
+with export_tab:
+    st.subheader("Export your clinic records")
+    st.caption("Exports contain identifiable patient information. Store downloaded files securely and share only with authorised people.")
+    export_map = {
+        "Patients": "SELECT patient_code AS patient_id, full_name, phone, email, registration_date, notes FROM patients ORDER BY id",
+        "Appointments": "SELECT a.id, p.patient_code AS patient_id, p.full_name, a.appointment_date, a.reason, a.status, a.notes FROM appointments a JOIN patients p ON p.id=a.patient_id ORDER BY a.id",
+        "Treatment plans": "SELECT t.id, p.patient_code AS patient_id, p.full_name, t.plan_date, t.description, t.estimated_amount, t.status, t.notes FROM treatment_plans t JOIN patients p ON p.id=t.patient_id ORDER BY t.id",
+        "Payments": "SELECT x.id, p.patient_code AS patient_id, p.full_name, x.payment_date, x.amount, x.method, x.description FROM payments x JOIN patients p ON p.id=x.patient_id ORDER BY x.id",
+        "Expenses": "SELECT id, expense_date, category, description, amount FROM expenses ORDER BY id",
+    }
+    for label, sql in export_map.items():
+        data = query_df(sql)
+        st.download_button(f"Download {label} CSV", data.to_csv(index=False).encode('utf-8'), file_name=label.lower().replace(' ','_')+'.csv', mime='text/csv', key='export_'+label)
+    st.divider()
+    st.markdown("**Database location**")
+    st.code(str(DB_PATH))
+    st.caption("Back up the database file only when the app is stopped or using a safe backup method. For hosted deployment, move to managed PostgreSQL with access controls and automated backups before real use.")
+
+st.sidebar.markdown("### Prototype notes")
+st.sidebar.caption("Single-clinic local SQLite prototype. No login, roles, audit log, encrypted database, automated backups, or multi-clinic separation yet.")
+st.sidebar.caption("Built with Streamlit + SQLite + Pandas + Plotly")
+
